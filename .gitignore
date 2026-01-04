@@ -1,0 +1,129 @@
+# =============================================================================
+# Obsidian Plugin .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Dependencies
+# -----------------------------------------------------------------------------
+node_modules/
+package-lock.json
+
+# -----------------------------------------------------------------------------
+# Build Artifacts
+# -----------------------------------------------------------------------------
+# NOTE: main.js is NOT ignored because this plugin uses plain JavaScript
+# (not TypeScript). The main.js file IS the source code.
+# If you convert to TypeScript later, uncomment the next line:
+# main.js
+
+# Source maps (if using TypeScript build)
+*.map
+
+# -----------------------------------------------------------------------------
+# IDE / Editor
+# -----------------------------------------------------------------------------
+# VS Code
+.vscode/
+
+# JetBrains (WebStorm, IntelliJ)
+.idea/
+*.iml
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# -----------------------------------------------------------------------------
+# OS Generated Files
+# -----------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+
+# -----------------------------------------------------------------------------
+# Obsidian
+# -----------------------------------------------------------------------------
+# Plugin data file (created in vault, not in repo)
+data.json
+
+# -----------------------------------------------------------------------------
+# Development Files (Claude Code / AI Assistant)
+# -----------------------------------------------------------------------------
+.claude/
+CLAUDE.md
+
+# -----------------------------------------------------------------------------
+# Development Reports, Analysis & Documentation
+# -----------------------------------------------------------------------------
+# Analysis and audit reports
+plugin_analysis_report.md
+fix_changelog.md
+fix_verification_report.md
+github_release_prep_report.md
+
+# Submission guides and checklists (for local reference only)
+SUBMISSION_CHECKLIST.md
+NEXT_STEPS_DETAILED.md
+
+# Any other markdown reports/docs (except README.md)
+*_report.md
+*_checklist.md
+*_analysis.md
+*_audit.md
+
+# -----------------------------------------------------------------------------
+# Backup Files
+# -----------------------------------------------------------------------------
+*.backup
+*.bak
+*.orig
+*.tmp
+
+# -----------------------------------------------------------------------------
+# Logs
+# -----------------------------------------------------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# -----------------------------------------------------------------------------
+# Environment Variables
+# -----------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+
+# -----------------------------------------------------------------------------
+# Testing
+# -----------------------------------------------------------------------------
+coverage/
+.nyc_output/
+
+# -----------------------------------------------------------------------------
+# Miscellaneous
+# -----------------------------------------------------------------------------
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
+# Compiled output (if any)
+dist/
+build/
+out/
