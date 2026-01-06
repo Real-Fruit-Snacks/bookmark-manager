@@ -172,7 +172,9 @@ const DEFAULT_SETTINGS = {
     // Headers
     showMainHeader: true,
     showSectionHeaders: true,
-    dashboardTitle: 'Bookmark Manager',
+    dashboardTitle: 'Bookmarks',
+    dashboardSubtitle: '',
+    showHeaderStats: true,
     sectionHeaderSpacing: 16,
     showBookmarkCounts: true,
     // Grouping
@@ -191,7 +193,6 @@ const DEFAULT_SETTINGS = {
     // Features
     enableKeyboardShortcuts: true,
     enableTags: true,
-    tagTextColor: '#ffffff',
     // Special Sections
     showFavorites: true,
     showRecentlyAdded: false,
@@ -211,9 +212,7 @@ const DEFAULT_SETTINGS = {
     presets: {},             // { "Preset Name": { grid: {...}, list: {...}, compact: {...} } }
     // Usage Analytics
     enableAnalytics: true,
-    showMostUsed: false,
     mostUsedCount: 10,
-    showDormant: false,
     dormantDaysThreshold: 30,
     // Archive System
     enableArchive: true,
@@ -280,10 +279,18 @@ class FrontpageView extends ItemView {
 
         // Initialize ResizeObserver for container-aware responsiveness
         // This handles sidebar resizing where media queries don't apply
+        // Using requestAnimationFrame to prevent "ResizeObserver loop" warnings
+        this._resizeRAF = null;
         this.resizeObserver = new ResizeObserver((entries) => {
-            for (const entry of entries) {
-                this.applyResponsiveClasses(entry.contentRect.width);
+            // Cancel any pending animation frame to debounce rapid resize events
+            if (this._resizeRAF) {
+                cancelAnimationFrame(this._resizeRAF);
             }
+            this._resizeRAF = requestAnimationFrame(() => {
+                for (const entry of entries) {
+                    this.applyResponsiveClasses(entry.contentRect.width);
+                }
+            });
         });
     }
 
@@ -453,10 +460,6 @@ class FrontpageView extends ItemView {
         container.style.setProperty('--fp-card-radius', `${modeSettings.cardBorderRadius ?? defaults.cardBorderRadius}px`);
         container.style.setProperty('--fp-card-padding', `${modeSettings.cardPadding ?? defaults.cardPadding}px`);
         container.style.setProperty('--fp-header-spacing', `${settings.sectionHeaderSpacing}px`);
-        const safeTagColor = sanitizeColor(settings.tagTextColor);
-        if (safeTagColor) {
-            container.style.setProperty('--fp-tag-text-color', safeTagColor);
-        }
 
         // Get data from settings-based storage (with tag filtering applied)
         const rawFavorites = this.plugin.getFavorites();
@@ -466,23 +469,53 @@ class FrontpageView extends ItemView {
         const recentlyAdded = this.filterBookmarksByTags(rawRecentlyAdded);
         const currentNoteBookmarks = this.filterBookmarksByTags(rawCurrentNote);
 
-        let groups = settings.groupOrder.map(name => {
-            const rawBookmarks = this.plugin.getGroupBookmarks(name);
+        // Get hierarchical group order for proper parent/child rendering
+        const hierarchicalOrder = this.plugin.getHierarchicalGroupOrder();
+        let groups = hierarchicalOrder.map(entry => {
+            const rawBookmarks = this.plugin.getGroupBookmarks(entry.name);
             return {
-                name,
+                name: entry.name,
                 bookmarks: this.filterBookmarksByTags(rawBookmarks),
-                icon: settings.groups[name]?.icon || '📁',
-                color: settings.groups[name]?.color || null
+                icon: settings.groups[entry.name]?.icon || '📁',
+                color: settings.groups[entry.name]?.color || null,
+                isSubGroup: entry.isSubGroup,
+                parentGroup: entry.parent,
+                depth: entry.depth
             };
-        }).filter(g => g.bookmarks.length > 0);
+        }).filter(g => {
+            // Keep groups with bookmarks OR parent groups with children that have bookmarks
+            if (g.bookmarks.length > 0) return true;
+            // Keep parent groups that have sub-groups with content
+            if (!g.isSubGroup) {
+                const children = this.plugin.getSubGroups(g.name);
+                return children.some(childName => {
+                    const childBookmarks = this.plugin.getGroupBookmarks(childName);
+                    return this.filterBookmarksByTags(childBookmarks).length > 0;
+                });
+            }
+            return false;
+        });
 
-        // Apply sort order
-        if (settings.sortOrder === 'alphabetical') {
-            groups = groups.sort((a, b) => a.name.localeCompare(b.name));
-        } else if (settings.sortOrder === 'alphabetical-reverse') {
-            groups = groups.sort((a, b) => b.name.localeCompare(a.name));
+        // Apply sort order (only for top-level groups, keeping sub-groups with their parents)
+        if (settings.sortOrder === 'alphabetical' || settings.sortOrder === 'alphabetical-reverse') {
+            // Separate into parent groups with their children
+            const parentGroups = groups.filter(g => !g.isSubGroup);
+            const sortFn = settings.sortOrder === 'alphabetical'
+                ? (a, b) => a.name.localeCompare(b.name)
+                : (a, b) => b.name.localeCompare(a.name);
+            parentGroups.sort(sortFn);
+
+            // Rebuild with children following their parents
+            const sortedGroups = [];
+            for (const parent of parentGroups) {
+                sortedGroups.push(parent);
+                const children = groups.filter(g => g.parentGroup === parent.name);
+                children.sort(sortFn);
+                sortedGroups.push(...children);
+            }
+            groups = sortedGroups;
         }
-        // 'default' keeps the original groupOrder order
+        // 'default' keeps the original hierarchical order
 
         // Find uncategorized bookmarks (not in any group)
         const allGroupedUrls = new Set();
@@ -521,7 +554,38 @@ class FrontpageView extends ItemView {
 
         if (settings.showMainHeader) {
             const header = contentContainer.createEl('div', { cls: 'frontpage-header' });
-            header.createEl('h1', { text: settings.dashboardTitle });
+
+            // Title section
+            const titleSection = header.createEl('div', { cls: 'frontpage-header-title-section' });
+            titleSection.createEl('h1', { text: settings.dashboardTitle });
+
+            if (settings.dashboardSubtitle) {
+                titleSection.createEl('p', {
+                    cls: 'frontpage-header-subtitle',
+                    text: settings.dashboardSubtitle
+                });
+            }
+
+            // Stats section
+            if (settings.showHeaderStats) {
+                const statsSection = header.createEl('div', { cls: 'frontpage-header-stats' });
+
+                const totalBookmarks = Object.keys(this.plugin.settings.bookmarks).length;
+                const totalGroups = Object.keys(this.plugin.settings.groups).length;
+                const totalFavorites = this.plugin.settings.favoriteUrls.length;
+
+                const bookmarkStat = statsSection.createEl('div', { cls: 'frontpage-header-stat' });
+                bookmarkStat.createEl('span', { cls: 'frontpage-header-stat-value', text: String(totalBookmarks) });
+                bookmarkStat.createEl('span', { cls: 'frontpage-header-stat-label', text: 'Bookmarks' });
+
+                const groupStat = statsSection.createEl('div', { cls: 'frontpage-header-stat' });
+                groupStat.createEl('span', { cls: 'frontpage-header-stat-value', text: String(totalGroups) });
+                groupStat.createEl('span', { cls: 'frontpage-header-stat-label', text: 'Groups' });
+
+                const favStat = statsSection.createEl('div', { cls: 'frontpage-header-stat' });
+                favStat.createEl('span', { cls: 'frontpage-header-stat-value', text: String(totalFavorites) });
+                favStat.createEl('span', { cls: 'frontpage-header-stat-label', text: 'Favorites' });
+            }
         }
 
         // Controls bar (search + add + collapse + view mode + refresh)
@@ -530,6 +594,28 @@ class FrontpageView extends ItemView {
         // Apply sticky/non-sticky class based on setting
         if (!settings.stickyControlsBar) {
             controlsBar.addClass('not-sticky');
+        } else {
+            // Add scroll detection for elevated shadow effect
+            const sentinel = contentContainer.createEl('div', {
+                cls: 'frontpage-scroll-sentinel',
+                attr: { 'aria-hidden': 'true' }
+            });
+            sentinel.style.cssText = 'position: absolute; top: 0; height: 1px; width: 1px; pointer-events: none;';
+
+            // Disconnect previous scroll observer if exists
+            if (this.scrollObserver) {
+                this.scrollObserver.disconnect();
+            }
+
+            this.scrollObserver = new IntersectionObserver(
+                (entries) => {
+                    entries.forEach(entry => {
+                        controlsBar.classList.toggle('is-scrolled', !entry.isIntersecting);
+                    });
+                },
+                { threshold: 0, rootMargin: '-1px 0px 0px 0px' }
+            );
+            this.scrollObserver.observe(sentinel);
         }
 
         // === LEFT ZONE: Primary Actions ===
@@ -546,10 +632,10 @@ class FrontpageView extends ItemView {
             new QuickAddBookmarkModal(this.app, this.plugin).open();
         });
 
-        // Select button for bulk operations (ghost style)
+        // Select button for bulk operations (ghost style) - collapses at narrow widths
         if (settings.enableBulkSelection) {
             const selectBtn = primaryZone.createEl('button', {
-                cls: `fp-btn fp-btn-ghost ${this.selectionMode ? 'is-active' : ''}`,
+                cls: `fp-btn fp-btn-ghost fp-collapse-narrow ${this.selectionMode ? 'is-active' : ''}`,
                 attr: {
                     title: this.selectionMode ? 'Cancel selection' : 'Select multiple bookmarks',
                     'aria-pressed': this.selectionMode ? 'true' : 'false',
@@ -599,9 +685,9 @@ class FrontpageView extends ItemView {
         // === RIGHT ZONE: Secondary Actions ===
         const secondaryZone = controlsBar.createEl('div', { cls: 'fp-zone-secondary' });
 
-        // View mode segmented control
+        // View mode segmented control - collapses at very narrow widths
         const viewToggle = secondaryZone.createEl('div', {
-            cls: 'fp-view-toggle',
+            cls: 'fp-view-toggle fp-collapse-very-narrow',
             attr: { role: 'group', 'aria-label': 'View mode' }
         });
 
@@ -636,14 +722,15 @@ class FrontpageView extends ItemView {
             });
         });
 
-        // Divider
-        secondaryZone.createEl('div', { cls: 'fp-divider' });
+        // Divider - collapses at narrow widths (already hidden by CSS, but mark it)
+        secondaryZone.createEl('div', { cls: 'fp-divider fp-collapse-narrow' });
 
-        // Filter button (ghost style)
+        // Filter button (ghost style) - collapses at narrow widths
         const allTags = this.plugin.getAllTags();
-        if (settings.enableTags && allTags.size > 0) {
+        const hasTagFilter = settings.enableTags && allTags.size > 0;
+        if (hasTagFilter) {
             const filterBtn = secondaryZone.createEl('button', {
-                cls: `fp-btn fp-btn-ghost ${this.activeTagFilters.size > 0 ? 'is-active' : ''}`,
+                cls: `fp-btn fp-btn-ghost fp-collapse-narrow ${this.activeTagFilters.size > 0 ? 'is-active' : ''}`,
                 attr: {
                     title: 'Filter by tags',
                     'aria-label': 'Filter by tags'
@@ -661,10 +748,10 @@ class FrontpageView extends ItemView {
             });
         }
 
-        // Insights button (ghost style)
+        // Insights button (ghost style) - collapses at narrow widths
         if (settings.enableAnalytics) {
             const insightsBtn = secondaryZone.createEl('button', {
-                cls: 'fp-btn fp-btn-ghost',
+                cls: 'fp-btn fp-btn-ghost fp-collapse-narrow',
                 attr: { title: 'View bookmark insights', 'aria-label': 'Bookmark insights' }
             });
             insightsBtn.innerHTML = LUCIDE_ICONS.barChart;
@@ -673,7 +760,7 @@ class FrontpageView extends ItemView {
             });
         }
 
-        // Overflow menu button (contains: Paste, Collapse, Expand, Refresh)
+        // Overflow menu button (contains collapsed actions + Paste, Collapse, Expand, Refresh)
         const overflowBtn = secondaryZone.createEl('button', {
             cls: 'fp-btn fp-btn-ghost',
             attr: { title: 'More actions', 'aria-label': 'More actions', 'aria-haspopup': 'menu' }
@@ -682,6 +769,66 @@ class FrontpageView extends ItemView {
 
         this._addRenderListener(overflowBtn, 'click', (e) => {
             const menu = new Menu();
+            const isNarrow = container.hasClass('frontpage-narrow') || container.hasClass('frontpage-very-narrow');
+            const isVeryNarrow = container.hasClass('frontpage-very-narrow');
+
+            // === Collapsed items (shown only at narrow widths) ===
+
+            // Select mode (collapsed at narrow)
+            if (isNarrow && settings.enableBulkSelection) {
+                menu.addItem(item => {
+                    item.setTitle(this.selectionMode ? 'Cancel Selection' : 'Select Multiple')
+                        .setIcon('check-square')
+                        .onClick(() => this.toggleSelectionMode());
+                });
+            }
+
+            // Filter by tags (collapsed at narrow)
+            if (isNarrow && hasTagFilter) {
+                menu.addItem(item => {
+                    const title = this.activeTagFilters.size > 0
+                        ? `Filter by Tags (${this.activeTagFilters.size})`
+                        : 'Filter by Tags';
+                    item.setTitle(title)
+                        .setIcon('tag')
+                        .onClick(() => new TagFilterModal(this.app, this.plugin, this).open());
+                });
+            }
+
+            // Insights (collapsed at narrow)
+            if (isNarrow && settings.enableAnalytics) {
+                menu.addItem(item => {
+                    item.setTitle('Insights')
+                        .setIcon('bar-chart-2')
+                        .onClick(() => new InsightsModal(this.app, this.plugin).open());
+                });
+            }
+
+            // View mode submenu (collapsed at very narrow)
+            if (isVeryNarrow) {
+                menu.addItem(item => {
+                    item.setTitle('View Mode')
+                        .setIcon('layout-grid');
+                    const submenu = item.setSubmenu();
+                    viewModes.forEach(({ mode, label }) => {
+                        submenu.addItem(sub => {
+                            sub.setTitle(label)
+                                .setChecked(settings.viewMode === mode)
+                                .onClick(async () => {
+                                    this.plugin.settings.viewMode = mode;
+                                    await this.plugin.saveSettings();
+                                });
+                        });
+                    });
+                });
+            }
+
+            // Add separator if we added collapsed items
+            if (isNarrow) {
+                menu.addSeparator();
+            }
+
+            // === Always-present items ===
 
             // Smart Paste
             if (settings.enableSmartPaste) {
@@ -1070,9 +1217,15 @@ class FrontpageView extends ItemView {
             const groupId = `frontpage-group-${group.name.replace(/\s+/g, '-').toLowerCase()}`;
             const isGroupCollapsed = this.collapsedSections.has(groupId);
 
+            // Add sub-group class if this is a child group
+            const subGroupClass = group.isSubGroup ? 'frontpage-subgroup' : 'frontpage-parent-group';
             const groupSection = bookmarksContainer.createEl('div', {
-                cls: `frontpage-folder frontpage-special-group frontpage-custom-group ${isGroupCollapsed ? 'is-collapsed' : ''}`,
-                attr: { id: groupId }
+                cls: `frontpage-folder frontpage-special-group frontpage-custom-group ${subGroupClass} ${isGroupCollapsed ? 'is-collapsed' : ''}`,
+                attr: {
+                    id: groupId,
+                    'data-parent-group': group.parentGroup || '',
+                    'data-depth': String(group.depth || 0)
+                }
             });
 
             // Apply custom color if set (with validation to prevent CSS injection)
@@ -1083,12 +1236,17 @@ class FrontpageView extends ItemView {
 
             // Add to TOC
             if (tocList) {
-                const tocItem = tocList.createEl('li', { cls: 'frontpage-toc-item' });
+                const tocItemClass = group.isSubGroup ? 'frontpage-toc-item frontpage-toc-subitem' : 'frontpage-toc-item';
+                const tocItem = tocList.createEl('li', { cls: tocItemClass });
+                const tocLinkClass = group.isSubGroup
+                    ? 'frontpage-toc-link frontpage-toc-folder frontpage-toc-subgroup'
+                    : 'frontpage-toc-link frontpage-toc-folder';
                 const tocLink = tocItem.createEl('a', {
-                    cls: 'frontpage-toc-link frontpage-toc-folder',
+                    cls: tocLinkClass,
                     href: `#${groupId}`
                 });
-                tocLink.createEl('span', { text: `${group.icon} ${group.name}` });
+                const displayName = group.isSubGroup ? `└ ${group.icon} ${group.name}` : `${group.icon} ${group.name}`;
+                tocLink.createEl('span', { text: displayName });
                 if (settings.showBookmarkCounts) {
                     tocLink.createEl('span', { cls: 'frontpage-toc-count', text: `${group.bookmarks.length}` });
                 }
@@ -1129,7 +1287,9 @@ class FrontpageView extends ItemView {
             }
 
             const titleWrapper = groupHeader.createEl('div', { cls: 'frontpage-title-wrapper' });
-            titleWrapper.createEl('h2', {
+            // Use h3 for sub-groups, h2 for top-level groups
+            const titleTag = group.isSubGroup ? 'h3' : 'h2';
+            titleWrapper.createEl(titleTag, {
                 cls: 'frontpage-folder-title',
                 text: `${group.icon} ${group.name}`
             });
@@ -1934,10 +2094,14 @@ class FrontpageView extends ItemView {
             item.setTitle('Create New Group...')
                 .setIcon('folder-plus')
                 .onClick(() => {
-                    new GroupNameModal(this.app, 'Create Group', '', async (name) => {
-                        if (name) {
-                            await this.plugin.createGroup(name);
-                            await this.batchAddToGroup(name);
+                    new CreateGroupModal(this.app, this.plugin, async (result) => {
+                        if (result && result.name) {
+                            await this.plugin.createGroup(result.name, {
+                                icon: result.icon,
+                                color: result.color,
+                                parentGroup: result.parentGroup
+                            });
+                            await this.batchAddToGroup(result.name);
                         }
                     }).open();
                 });
@@ -2250,6 +2414,38 @@ class FrontpageView extends ItemView {
 
         menu.addSeparator();
 
+        // Edit Group (comprehensive modal for name, icon, color, parent)
+        menu.addItem((item) => {
+            item.setTitle('Edit Group...')
+                .setIcon('settings')
+                .onClick(() => {
+                    new EditGroupModal(this.app, this.plugin, groupName, async (result) => {
+                        // Handle rename if name changed
+                        if (result.name !== result.originalName) {
+                            const renamed = await this.plugin.renameGroup(result.originalName, result.name);
+                            if (!renamed) {
+                                new Notice(`Failed to rename group`);
+                                return;
+                            }
+                        }
+                        // Update icon and color
+                        await this.plugin.updateGroup(result.name, {
+                            icon: result.icon,
+                            color: result.color
+                        });
+                        // Update parent if changed
+                        const currentParent = this.plugin.getParentGroup(result.name);
+                        if (result.parentGroup !== currentParent) {
+                            await this.plugin.setParentGroup(result.name, result.parentGroup);
+                        }
+                        new Notice(`Group "${result.name}" updated`);
+                    }).open();
+                });
+        });
+
+        menu.addSeparator();
+
+        // Quick edit options (for convenience)
         // Change icon
         menu.addItem((item) => {
             item.setTitle('Change Icon')
@@ -2277,8 +2473,6 @@ class FrontpageView extends ItemView {
                     colorInput.click();
                 });
         });
-
-        menu.addSeparator();
 
         // Rename group
         menu.addItem((item) => {
@@ -2316,6 +2510,75 @@ class FrontpageView extends ItemView {
                     .setIcon('arrow-down')
                     .onClick(async () => {
                         await this.plugin.moveGroup(groupName, groupIdx + 1);
+                    });
+            });
+        }
+
+        menu.addSeparator();
+
+        // Sub-group management options
+        const isTopLevel = this.plugin.isTopLevelGroup(groupName);
+        const isSubGroup = this.plugin.isSubGroup(groupName);
+        const hasChildren = this.plugin.getSubGroups(groupName).length > 0;
+
+        // For top-level groups: Add Sub-group
+        if (isTopLevel) {
+            menu.addItem((item) => {
+                item.setTitle('Add Sub-group...')
+                    .setIcon('folder-plus')
+                    .onClick(() => {
+                        new CreateGroupModal(this.app, this.plugin, async (result) => {
+                            if (result && result.name) {
+                                const created = await this.plugin.createGroup(result.name, {
+                                    icon: result.icon,
+                                    color: result.color,
+                                    parentGroup: groupName
+                                });
+                                if (created) {
+                                    new Notice(`Created sub-group "${result.name}"`);
+                                } else {
+                                    new Notice(`Could not create sub-group`);
+                                }
+                            }
+                        }, { initialParent: groupName, title: 'Create Sub-group' }).open();
+                    });
+            });
+        }
+
+        // For top-level groups without children: Move to Sub-group of...
+        if (isTopLevel && !hasChildren) {
+            const otherParents = settings.groupOrder.filter(n =>
+                n !== groupName && this.plugin.isTopLevelGroup(n)
+            );
+
+            if (otherParents.length > 0) {
+                menu.addItem((item) => {
+                    item.setTitle('Move to Sub-group of...')
+                        .setIcon('corner-down-right');
+
+                    const submenu = item.setSubmenu();
+                    for (const parentName of otherParents) {
+                        const parentIcon = settings.groups[parentName]?.icon || '📁';
+                        submenu.addItem((subItem) => {
+                            subItem.setTitle(`${parentIcon} ${parentName}`)
+                                .onClick(async () => {
+                                    await this.plugin.setParentGroup(groupName, parentName);
+                                    new Notice(`Moved "${groupName}" under "${parentName}"`);
+                                });
+                        });
+                    }
+                });
+            }
+        }
+
+        // For sub-groups: Promote to Top-Level
+        if (isSubGroup) {
+            menu.addItem((item) => {
+                item.setTitle('Promote to Top-Level')
+                    .setIcon('corner-up-left')
+                    .onClick(async () => {
+                        await this.plugin.setParentGroup(groupName, null);
+                        new Notice(`"${groupName}" is now a top-level group`);
                     });
             });
         }
@@ -2590,16 +2853,19 @@ class FrontpageView extends ItemView {
             item.setTitle('Move All to New Group...')
                 .setIcon('folder-plus')
                 .onClick(() => {
-                    new GroupNameModal(this.app, async (groupName) => {
-                        if (groupName && groupName.trim()) {
-                            const trimmedName = groupName.trim();
-                            await this.plugin.createGroup(trimmedName);
+                    new CreateGroupModal(this.app, this.plugin, async (result) => {
+                        if (result && result.name) {
+                            await this.plugin.createGroup(result.name, {
+                                icon: result.icon,
+                                color: result.color,
+                                parentGroup: result.parentGroup
+                            });
                             for (const bookmark of uncategorizedBookmarks) {
-                                await this.plugin.addToGroup(bookmark.url, trimmedName);
+                                await this.plugin.addToGroup(bookmark.url, result.name);
                             }
-                            new Notice(`Moved ${uncategorizedBookmarks.length} bookmarks to "${trimmedName}"`);
+                            new Notice(`Moved ${uncategorizedBookmarks.length} bookmarks to "${result.name}"`);
                         }
-                    }, '', 'Create New Group', 'Create').open();
+                    }).open();
                 });
         });
 
@@ -2608,20 +2874,23 @@ class FrontpageView extends ItemView {
 
     // Helper to create a new group and add bookmark to it
     async createGroupAndAdd(bookmark) {
-        new GroupNameModal(this.app, async (groupName) => {
-            if (groupName && groupName.trim()) {
-                const trimmedName = groupName.trim();
-                const created = await this.plugin.createGroup(trimmedName);
+        new CreateGroupModal(this.app, this.plugin, async (result) => {
+            if (result && result.name) {
+                const created = await this.plugin.createGroup(result.name, {
+                    icon: result.icon,
+                    color: result.color,
+                    parentGroup: result.parentGroup
+                });
                 if (created) {
-                    await this.plugin.addToGroup(bookmark.url, trimmedName);
-                    new Notice(`Created group "${trimmedName}" and added bookmark`);
+                    await this.plugin.addToGroup(bookmark.url, result.name);
+                    new Notice(`Created group "${result.name}" and added bookmark`);
                 } else {
                     // Group already exists, just add to it
-                    await this.plugin.addToGroup(bookmark.url, trimmedName);
-                    new Notice(`Added to existing group "${trimmedName}"`);
+                    await this.plugin.addToGroup(bookmark.url, result.name);
+                    new Notice(`Added to existing group "${result.name}"`);
                 }
             }
-        }, '', 'Create New Group', 'Create').open();
+        }).open();
     }
 
     filterBookmarks(query, settings) {
@@ -3120,6 +3389,14 @@ class FrontpageView extends ItemView {
         if (this.resizeObserver) {
             this.resizeObserver.disconnect();
         }
+        // Clean up pending resize animation frame
+        if (this._resizeRAF) {
+            cancelAnimationFrame(this._resizeRAF);
+        }
+        // Clean up the scroll observer (for sticky controls bar)
+        if (this.scrollObserver) {
+            this.scrollObserver.disconnect();
+        }
         // Clear favicon cache to free memory
         if (this.faviconCache) {
             this.faviconCache.clear();
@@ -3500,6 +3777,407 @@ class TagAutocompleteInput {
     }
 }
 
+/**
+ * Combobox input for selecting or creating a group
+ * Shows existing groups with hierarchy, allows inline creation with icon/color/parent
+ */
+class GroupComboboxInput {
+    constructor(container, plugin, options = {}) {
+        this.container = container;
+        this.plugin = plugin;
+        this.options = {
+            placeholder: 'Select or create group...',
+            maxSuggestions: 10,
+            ...options
+        };
+        this.selectedGroup = options.initialValue || null;
+        this.isCreatingNew = false;
+        this.newGroupData = {
+            name: '',
+            icon: '📁',
+            color: '',
+            parentGroup: null
+        };
+        this.highlightedIndex = -1;
+        this.suggestions = [];
+        this.render();
+    }
+
+    render() {
+        // Main wrapper
+        this.wrapper = this.container.createEl('div', { cls: 'frontpage-group-combobox' });
+
+        // Input wrapper with clear button
+        this.inputWrapper = this.wrapper.createEl('div', { cls: 'frontpage-group-combobox-input-wrapper' });
+
+        // Text input
+        this.input = this.inputWrapper.createEl('input', {
+            cls: 'frontpage-group-combobox-input frontpage-modal-input',
+            attr: {
+                type: 'text',
+                placeholder: this.options.placeholder
+            }
+        });
+
+        if (this.selectedGroup) {
+            const group = this.plugin.settings.groups[this.selectedGroup];
+            this.input.value = group ? `${group.icon || '📁'} ${this.selectedGroup}` : this.selectedGroup;
+        }
+
+        // Clear button
+        this.clearBtn = this.inputWrapper.createEl('button', {
+            cls: 'frontpage-group-combobox-clear',
+            attr: { type: 'button', 'aria-label': 'Clear selection' }
+        });
+        this.clearBtn.textContent = '×';
+        this.clearBtn.style.display = this.selectedGroup ? 'block' : 'none';
+
+        // Dropdown for suggestions
+        this.dropdown = this.wrapper.createEl('div', { cls: 'frontpage-group-combobox-dropdown' });
+
+        // Inline creator (hidden initially)
+        this.creatorEl = this.wrapper.createEl('div', { cls: 'frontpage-group-creator' });
+        this.creatorEl.style.display = 'none';
+
+        // Event listeners
+        this.input.addEventListener('input', () => this.onInputChange());
+        this.input.addEventListener('keydown', (e) => this.handleKeydown(e));
+        this.input.addEventListener('focus', () => {
+            if (!this.isCreatingNew) {
+                this.onInputChange();
+            }
+        });
+        this.input.addEventListener('blur', () => {
+            // Delay to allow click on suggestion
+            setTimeout(() => this.hideDropdown(), 150);
+        });
+
+        this.clearBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.clearSelection();
+        });
+    }
+
+    clearSelection() {
+        this.selectedGroup = null;
+        this.isCreatingNew = false;
+        this.newGroupData = { name: '', icon: '📁', color: '', parentGroup: null };
+        this.input.value = '';
+        this.input.placeholder = this.options.placeholder;
+        this.clearBtn.style.display = 'none';
+        this.creatorEl.style.display = 'none';
+        this.input.focus();
+    }
+
+    onInputChange() {
+        const query = this.input.value.trim().toLowerCase();
+        this.updateSuggestions(query);
+    }
+
+    updateSuggestions(query) {
+        // Get hierarchical group order
+        const hierarchicalGroups = this.plugin.getHierarchicalGroupOrder();
+
+        // Filter groups that match query
+        let matches = [];
+        for (const entry of hierarchicalGroups) {
+            const group = this.plugin.settings.groups[entry.name];
+            if (!group) continue;
+
+            const displayName = entry.name.toLowerCase();
+            if (!query || displayName.includes(query)) {
+                matches.push({
+                    name: entry.name,
+                    icon: group.icon || '📁',
+                    isSubGroup: entry.isSubGroup,
+                    parent: entry.parent,
+                    isExact: displayName === query
+                });
+            }
+        }
+
+        // Sort: exact matches first, then by hierarchy
+        matches.sort((a, b) => {
+            if (a.isExact && !b.isExact) return -1;
+            if (!a.isExact && b.isExact) return 1;
+            return 0;
+        });
+
+        // Limit suggestions
+        matches = matches.slice(0, this.options.maxSuggestions);
+
+        // Check if we should show "create new" option
+        const exactMatch = matches.some(m => m.name.toLowerCase() === query);
+        const showCreateNew = query && !exactMatch;
+
+        this.suggestions = matches;
+        this.highlightedIndex = -1;
+
+        // Render dropdown
+        this.dropdown.empty();
+
+        if (matches.length === 0 && !showCreateNew) {
+            this.hideDropdown();
+            return;
+        }
+
+        for (let i = 0; i < matches.length; i++) {
+            const { name, icon, isSubGroup } = matches[i];
+            const item = this.dropdown.createEl('div', {
+                cls: `frontpage-group-suggestion ${isSubGroup ? 'is-subgroup' : ''}`
+            });
+            item.setAttribute('data-index', String(i));
+
+            const prefix = isSubGroup ? '└ ' : '';
+            item.createEl('span', { cls: 'frontpage-group-suggestion-icon', text: icon });
+            item.createEl('span', { cls: 'frontpage-group-suggestion-name', text: `${prefix}${name}` });
+
+            item.addEventListener('mouseenter', () => this.setHighlight(i));
+            item.addEventListener('click', () => this.selectGroup(name));
+        }
+
+        // Add "create new" option if query doesn't match existing
+        if (showCreateNew) {
+            const createIndex = matches.length;
+            const rawQuery = this.input.value.trim();
+
+            // Add separator if there are existing matches
+            if (matches.length > 0) {
+                this.dropdown.createEl('div', { cls: 'frontpage-group-suggestion-separator' });
+            }
+
+            const createItem = this.dropdown.createEl('div', {
+                cls: 'frontpage-group-suggestion frontpage-group-suggestion-create'
+            });
+            createItem.setAttribute('data-index', String(createIndex));
+            createItem.createEl('span', { cls: 'frontpage-group-suggestion-icon', text: '➕' });
+            createItem.createEl('span', { text: `Create "${rawQuery}"` });
+
+            createItem.addEventListener('mouseenter', () => this.setHighlight(createIndex));
+            createItem.addEventListener('click', () => this.startNewGroupCreation(rawQuery));
+
+            this.suggestions.push({ name: rawQuery, icon: '📁', isNew: true });
+        }
+
+        this.showDropdown();
+    }
+
+    setHighlight(index) {
+        const items = this.dropdown.querySelectorAll('.frontpage-group-suggestion');
+        items.forEach(item => item.removeClass('is-highlighted'));
+
+        this.highlightedIndex = index;
+        if (index >= 0 && index < items.length) {
+            items[index].addClass('is-highlighted');
+        }
+    }
+
+    handleKeydown(e) {
+        const items = this.dropdown.querySelectorAll('.frontpage-group-suggestion');
+
+        switch (e.key) {
+            case 'ArrowDown':
+                e.preventDefault();
+                if (items.length > 0) {
+                    const newIndex = this.highlightedIndex < items.length - 1
+                        ? this.highlightedIndex + 1
+                        : 0;
+                    this.setHighlight(newIndex);
+                }
+                break;
+
+            case 'ArrowUp':
+                e.preventDefault();
+                if (items.length > 0) {
+                    const newIndex = this.highlightedIndex > 0
+                        ? this.highlightedIndex - 1
+                        : items.length - 1;
+                    this.setHighlight(newIndex);
+                }
+                break;
+
+            case 'Enter':
+                e.preventDefault();
+                if (this.highlightedIndex >= 0 && this.highlightedIndex < this.suggestions.length) {
+                    const suggestion = this.suggestions[this.highlightedIndex];
+                    if (suggestion.isNew) {
+                        this.startNewGroupCreation(suggestion.name);
+                    } else {
+                        this.selectGroup(suggestion.name);
+                    }
+                }
+                break;
+
+            case 'Escape':
+                this.hideDropdown();
+                break;
+        }
+    }
+
+    selectGroup(name) {
+        const group = this.plugin.settings.groups[name];
+        if (!group) return;
+
+        this.selectedGroup = name;
+        this.isCreatingNew = false;
+        this.input.value = `${group.icon || '📁'} ${name}`;
+        this.clearBtn.style.display = 'block';
+        this.creatorEl.style.display = 'none';
+        this.hideDropdown();
+    }
+
+    startNewGroupCreation(name) {
+        this.isCreatingNew = true;
+        this.selectedGroup = null;
+        this.newGroupData = {
+            name: name,
+            icon: '📁',
+            color: '',
+            parentGroup: null
+        };
+
+        this.input.value = name;
+        this.clearBtn.style.display = 'block';
+        this.hideDropdown();
+        this.renderCreator();
+    }
+
+    renderCreator() {
+        this.creatorEl.empty();
+        this.creatorEl.style.display = 'block';
+
+        // Header
+        const header = this.creatorEl.createEl('div', { cls: 'frontpage-group-creator-header' });
+        header.createEl('span', { text: `Creating: "${this.newGroupData.name}"` });
+
+        // Icon section
+        const iconSection = this.creatorEl.createEl('div', { cls: 'frontpage-group-creator-section' });
+        iconSection.createEl('label', { text: 'Icon:' });
+
+        const iconGrid = iconSection.createEl('div', { cls: 'frontpage-group-creator-icons' });
+        const emojis = [
+            '📁', '📂', '⭐', '❤️', '💼', '🏠', '🎮', '🎵', '📚', '🔧',
+            '💡', '🎯', '🚀', '💻', '📱', '🌐', '🔒', '📧', '📰', '🛒',
+            '🎨', '📷', '🎬', '✈️', '🍔', '☕', '🏃', '💪', '🧠', '📊',
+            '💰', '🎁', '🔔', '⚡', '🌟', '🔥', '💎', '🏆', '👤', '👥'
+        ];
+
+        for (const emoji of emojis) {
+            const btn = iconGrid.createEl('button', {
+                cls: `frontpage-icon-btn ${emoji === this.newGroupData.icon ? 'is-selected' : ''}`,
+                attr: { type: 'button' }
+            });
+            btn.textContent = emoji;
+            btn.addEventListener('click', () => {
+                this.newGroupData.icon = emoji;
+                iconGrid.querySelectorAll('.frontpage-icon-btn').forEach(b => b.removeClass('is-selected'));
+                btn.addClass('is-selected');
+            });
+        }
+
+        // Custom icon input
+        const customIconWrapper = iconSection.createEl('div', { cls: 'frontpage-group-creator-custom-icon' });
+        const customInput = customIconWrapper.createEl('input', {
+            cls: 'frontpage-modal-input',
+            attr: { type: 'text', placeholder: 'Custom', maxlength: '2' }
+        });
+        customInput.style.width = '50px';
+        const useBtn = customIconWrapper.createEl('button', {
+            cls: 'frontpage-small-btn',
+            attr: { type: 'button' },
+            text: 'Use'
+        });
+        useBtn.addEventListener('click', () => {
+            if (customInput.value.trim()) {
+                this.newGroupData.icon = customInput.value.trim();
+                iconGrid.querySelectorAll('.frontpage-icon-btn').forEach(b => b.removeClass('is-selected'));
+            }
+        });
+
+        // Color section
+        const colorSection = this.creatorEl.createEl('div', { cls: 'frontpage-group-creator-section' });
+        colorSection.createEl('label', { text: 'Color:' });
+
+        const colorWrapper = colorSection.createEl('div', { cls: 'frontpage-group-creator-color' });
+        const colorInput = colorWrapper.createEl('input', {
+            attr: { type: 'color', value: this.newGroupData.color || '#5090d0' }
+        });
+        colorInput.addEventListener('input', () => {
+            this.newGroupData.color = colorInput.value;
+        });
+        // Initialize with the color input's value if no color was set
+        if (!this.newGroupData.color) {
+            this.newGroupData.color = colorInput.value;
+        }
+
+        // Parent group section
+        const parentSection = this.creatorEl.createEl('div', { cls: 'frontpage-group-creator-section' });
+        parentSection.createEl('label', { text: 'Parent Group:' });
+
+        const parentSelect = parentSection.createEl('select', { cls: 'frontpage-modal-select' });
+        parentSelect.createEl('option', { text: 'None (top-level)', attr: { value: '' } });
+
+        // Add only top-level groups as parent options
+        for (const name of this.plugin.settings.groupOrder) {
+            const group = this.plugin.settings.groups[name];
+            if (group && !group.parentGroup) {
+                const icon = group.icon || '📁';
+                parentSelect.createEl('option', {
+                    text: `${icon} ${name}`,
+                    attr: { value: name }
+                });
+            }
+        }
+
+        parentSelect.addEventListener('change', () => {
+            this.newGroupData.parentGroup = parentSelect.value || null;
+        });
+    }
+
+    showDropdown() {
+        // Position dropdown using fixed positioning to escape modal overflow
+        const rect = this.inputWrapper.getBoundingClientRect();
+        this.dropdown.style.position = 'fixed';
+        this.dropdown.style.top = `${rect.bottom + 4}px`;
+        this.dropdown.style.left = `${rect.left}px`;
+        this.dropdown.style.width = `${rect.width}px`;
+        this.dropdown.addClass('is-visible');
+    }
+
+    hideDropdown() {
+        this.dropdown.removeClass('is-visible');
+        this.highlightedIndex = -1;
+    }
+
+    /**
+     * Get the selected group or new group data
+     * @returns {Object|null} { name, icon?, color?, parentGroup?, isNew: boolean } or null
+     */
+    getSelectedGroup() {
+        if (this.isCreatingNew && this.newGroupData.name) {
+            return {
+                name: this.newGroupData.name,
+                icon: this.newGroupData.icon,
+                color: this.newGroupData.color,
+                parentGroup: this.newGroupData.parentGroup,
+                isNew: true
+            };
+        }
+        if (this.selectedGroup) {
+            return {
+                name: this.selectedGroup,
+                isNew: false
+            };
+        }
+        return null;
+    }
+
+    destroy() {
+        this.wrapper.remove();
+    }
+}
+
 class IconPickerModal extends Modal {
     constructor(app, onSelect) {
         super(app);
@@ -3545,6 +4223,381 @@ class IconPickerModal extends Modal {
                 this.close();
             }
         });
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+/**
+ * Modal for creating a new group with name, icon, color, and optional parent
+ * Replaces GroupNameModal for creation scenarios (not rename)
+ */
+class CreateGroupModal extends Modal {
+    /**
+     * @param {App} app
+     * @param {FrontpagePlugin} plugin
+     * @param {Function} onSubmit - Called with { name, icon, color, parentGroup } on success
+     * @param {Object} options - Configuration options
+     * @param {string} [options.initialName] - Pre-filled name
+     * @param {string} [options.initialIcon] - Pre-selected icon
+     * @param {string} [options.initialColor] - Pre-selected color
+     * @param {string} [options.initialParent] - Pre-selected parent group
+     * @param {string} [options.title] - Modal title
+     * @param {string} [options.buttonText] - Submit button text
+     */
+    constructor(app, plugin, onSubmit, options = {}) {
+        super(app);
+        this.plugin = plugin;
+        this.onSubmit = onSubmit;
+        this.options = {
+            initialName: '',
+            initialIcon: '📁',
+            initialColor: '#5090d0',
+            initialParent: null,
+            title: 'Create Group',
+            buttonText: 'Create',
+            ...options
+        };
+        this.selectedIcon = this.options.initialIcon;
+        this.selectedColor = this.options.initialColor;
+        this.selectedParent = this.options.initialParent;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.addClass('frontpage-create-group-modal');
+        contentEl.createEl('h3', { text: this.options.title });
+
+        // Name input
+        const nameContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+        nameContainer.createEl('label', { text: 'Name' });
+        const nameInput = nameContainer.createEl('input', {
+            cls: 'frontpage-modal-input',
+            attr: { type: 'text', placeholder: 'Group name' }
+        });
+        nameInput.value = this.options.initialName;
+
+        // Icon section
+        const iconContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+        iconContainer.createEl('label', { text: 'Icon' });
+
+        const iconGrid = iconContainer.createEl('div', { cls: 'frontpage-icon-grid frontpage-icon-grid-inline' });
+        const emojis = [
+            '📁', '📂', '⭐', '❤️', '💼', '🏠', '🎮', '🎵', '📚', '🔧',
+            '💡', '🎯', '🚀', '💻', '📱', '🌐', '🔒', '📧', '📰', '🛒',
+            '🎨', '📷', '🎬', '✈️', '🍔', '☕', '🏃', '💪', '🧠', '📊',
+            '💰', '🎁', '🔔', '⚡', '🌟', '🔥', '💎', '🏆', '👤', '👥'
+        ];
+
+        for (const emoji of emojis) {
+            const btn = iconGrid.createEl('button', {
+                cls: `frontpage-icon-btn ${emoji === this.selectedIcon ? 'is-selected' : ''}`,
+                attr: { type: 'button' }
+            });
+            btn.textContent = emoji;
+            btn.addEventListener('click', () => {
+                this.selectedIcon = emoji;
+                iconGrid.querySelectorAll('.frontpage-icon-btn').forEach(b => b.removeClass('is-selected'));
+                btn.addClass('is-selected');
+            });
+        }
+
+        // Custom icon input
+        const customContainer = iconContainer.createEl('div', { cls: 'frontpage-custom-icon' });
+        customContainer.createEl('span', { text: 'Custom: ' });
+        const customInput = customContainer.createEl('input', {
+            cls: 'frontpage-modal-input',
+            attr: { type: 'text', placeholder: 'Any emoji', maxlength: '2' }
+        });
+        customInput.style.width = '60px';
+        const customBtn = customContainer.createEl('button', {
+            cls: 'frontpage-small-btn',
+            attr: { type: 'button' },
+            text: 'Use'
+        });
+        customBtn.addEventListener('click', () => {
+            if (customInput.value.trim()) {
+                this.selectedIcon = customInput.value.trim();
+                iconGrid.querySelectorAll('.frontpage-icon-btn').forEach(b => b.removeClass('is-selected'));
+            }
+        });
+
+        // Color section
+        const colorContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+        colorContainer.createEl('label', { text: 'Color' });
+
+        const colorWrapper = colorContainer.createEl('div', { cls: 'frontpage-color-picker-row' });
+        const colorInput = colorWrapper.createEl('input', {
+            attr: { type: 'color', value: this.selectedColor }
+        });
+        const colorPreview = colorWrapper.createEl('span', { cls: 'frontpage-color-preview' });
+        colorPreview.style.backgroundColor = this.selectedColor;
+        colorPreview.textContent = this.selectedColor;
+
+        colorInput.addEventListener('input', () => {
+            this.selectedColor = colorInput.value;
+            colorPreview.style.backgroundColor = colorInput.value;
+            colorPreview.textContent = colorInput.value;
+        });
+
+        // Parent group section
+        const parentContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+        parentContainer.createEl('label', { text: 'Parent Group (optional)' });
+
+        const parentSelect = parentContainer.createEl('select', { cls: 'frontpage-modal-select' });
+        parentSelect.createEl('option', { text: 'None (top-level)', attr: { value: '' } });
+
+        // Add only top-level groups as parent options
+        for (const name of this.plugin.settings.groupOrder) {
+            const group = this.plugin.settings.groups[name];
+            if (group && !group.parentGroup) {
+                const icon = group.icon || '📁';
+                const option = parentSelect.createEl('option', {
+                    text: `${icon} ${name}`,
+                    attr: { value: name }
+                });
+                if (name === this.selectedParent) {
+                    option.selected = true;
+                }
+            }
+        }
+
+        parentSelect.addEventListener('change', () => {
+            this.selectedParent = parentSelect.value || null;
+        });
+
+        // Buttons
+        const buttonContainer = contentEl.createEl('div', { cls: 'frontpage-modal-buttons' });
+
+        const submitBtn = buttonContainer.createEl('button', {
+            cls: 'mod-cta',
+            text: this.options.buttonText
+        });
+        submitBtn.addEventListener('click', () => {
+            const name = nameInput.value.trim();
+            if (!name) {
+                new Notice('Please enter a group name');
+                return;
+            }
+            if (this.plugin.settings.groups[name]) {
+                new Notice('A group with this name already exists');
+                return;
+            }
+            this.onSubmit({
+                name,
+                icon: this.selectedIcon,
+                color: this.selectedColor,
+                parentGroup: this.selectedParent
+            });
+            this.close();
+        });
+
+        const cancelBtn = buttonContainer.createEl('button', { text: 'Cancel' });
+        cancelBtn.addEventListener('click', () => this.close());
+
+        // Handle Enter key in name input
+        nameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                submitBtn.click();
+            }
+        });
+
+        // Focus name input
+        nameInput.focus();
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+/**
+ * Modal for editing an existing group's name, icon, color, and parent
+ */
+class EditGroupModal extends Modal {
+    /**
+     * @param {App} app
+     * @param {FrontpagePlugin} plugin
+     * @param {string} groupName - The name of the group to edit
+     * @param {Function} onSave - Called with { name, icon, color, parentGroup } on save
+     */
+    constructor(app, plugin, groupName, onSave) {
+        super(app);
+        this.plugin = plugin;
+        this.groupName = groupName;
+        this.onSave = onSave;
+
+        const group = plugin.settings.groups[groupName];
+        this.originalName = groupName;
+        this.selectedIcon = group?.icon || '📁';
+        this.selectedColor = group?.color || '#5090d0';
+        this.selectedParent = group?.parentGroup || null;
+        this.hasChildren = plugin.getSubGroups(groupName).length > 0;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.addClass('frontpage-create-group-modal');
+        contentEl.createEl('h3', { text: 'Edit Group' });
+
+        // Name input
+        const nameContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+        nameContainer.createEl('label', { text: 'Name' });
+        const nameInput = nameContainer.createEl('input', {
+            cls: 'frontpage-modal-input',
+            attr: { type: 'text', placeholder: 'Group name' }
+        });
+        nameInput.value = this.groupName;
+
+        // Icon section
+        const iconContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+        iconContainer.createEl('label', { text: 'Icon' });
+
+        const iconGrid = iconContainer.createEl('div', { cls: 'frontpage-icon-grid frontpage-icon-grid-inline' });
+        const emojis = [
+            '📁', '📂', '⭐', '❤️', '💼', '🏠', '🎮', '🎵', '📚', '🔧',
+            '💡', '🎯', '🚀', '💻', '📱', '🌐', '🔒', '📧', '📰', '🛒',
+            '🎨', '📷', '🎬', '✈️', '🍔', '☕', '🏃', '💪', '🧠', '📊',
+            '💰', '🎁', '🔔', '⚡', '🌟', '🔥', '💎', '🏆', '👤', '👥'
+        ];
+
+        for (const emoji of emojis) {
+            const btn = iconGrid.createEl('button', {
+                cls: `frontpage-icon-btn ${emoji === this.selectedIcon ? 'is-selected' : ''}`,
+                attr: { type: 'button' }
+            });
+            btn.textContent = emoji;
+            btn.addEventListener('click', () => {
+                this.selectedIcon = emoji;
+                iconGrid.querySelectorAll('.frontpage-icon-btn').forEach(b => b.removeClass('is-selected'));
+                btn.addClass('is-selected');
+            });
+        }
+
+        // Custom icon input
+        const customContainer = iconContainer.createEl('div', { cls: 'frontpage-custom-icon' });
+        customContainer.createEl('span', { text: 'Custom: ' });
+        const customInput = customContainer.createEl('input', {
+            cls: 'frontpage-modal-input',
+            attr: { type: 'text', placeholder: 'Any emoji', maxlength: '2' }
+        });
+        customInput.style.width = '60px';
+        const customBtn = customContainer.createEl('button', {
+            cls: 'frontpage-small-btn',
+            attr: { type: 'button' },
+            text: 'Use'
+        });
+        customBtn.addEventListener('click', () => {
+            if (customInput.value.trim()) {
+                this.selectedIcon = customInput.value.trim();
+                iconGrid.querySelectorAll('.frontpage-icon-btn').forEach(b => b.removeClass('is-selected'));
+            }
+        });
+
+        // Color section
+        const colorContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+        colorContainer.createEl('label', { text: 'Color' });
+
+        const colorWrapper = colorContainer.createEl('div', { cls: 'frontpage-color-picker-row' });
+        const colorInput = colorWrapper.createEl('input', {
+            attr: { type: 'color', value: this.selectedColor || '#5090d0' }
+        });
+        const colorPreview = colorWrapper.createEl('span', { cls: 'frontpage-color-preview' });
+        colorPreview.style.backgroundColor = this.selectedColor || '#5090d0';
+        colorPreview.textContent = this.selectedColor || '#5090d0';
+
+        colorInput.addEventListener('input', () => {
+            this.selectedColor = colorInput.value;
+            colorPreview.style.backgroundColor = colorInput.value;
+            colorPreview.textContent = colorInput.value;
+        });
+
+        // Parent group section (only show if this group doesn't have children)
+        if (!this.hasChildren) {
+            const parentContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+            parentContainer.createEl('label', { text: 'Parent Group' });
+
+            const parentSelect = parentContainer.createEl('select', { cls: 'frontpage-modal-select' });
+            parentSelect.createEl('option', { text: 'None (top-level)', attr: { value: '' } });
+
+            // Add only top-level groups as parent options (excluding self)
+            for (const name of this.plugin.settings.groupOrder) {
+                if (name === this.groupName) continue; // Can't be own parent
+                const group = this.plugin.settings.groups[name];
+                if (group && !group.parentGroup) {
+                    const icon = group.icon || '📁';
+                    const option = parentSelect.createEl('option', {
+                        text: `${icon} ${name}`,
+                        attr: { value: name }
+                    });
+                    if (name === this.selectedParent) {
+                        option.selected = true;
+                    }
+                }
+            }
+
+            parentSelect.addEventListener('change', () => {
+                this.selectedParent = parentSelect.value || null;
+            });
+        } else {
+            // Show info that parent can't be changed because group has children
+            const infoContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
+            infoContainer.createEl('label', { text: 'Parent Group' });
+            const infoText = infoContainer.createEl('div', {
+                cls: 'frontpage-edit-group-info',
+                text: 'This group has sub-groups and cannot be moved under another group.'
+            });
+            infoText.style.color = 'var(--text-muted)';
+            infoText.style.fontSize = '12px';
+            infoText.style.fontStyle = 'italic';
+        }
+
+        // Buttons
+        const buttonContainer = contentEl.createEl('div', { cls: 'frontpage-modal-buttons' });
+
+        const saveBtn = buttonContainer.createEl('button', {
+            cls: 'mod-cta',
+            text: 'Save'
+        });
+        saveBtn.addEventListener('click', async () => {
+            const newName = nameInput.value.trim();
+            if (!newName) {
+                new Notice('Please enter a group name');
+                return;
+            }
+            // Check if renaming to an existing group name
+            if (newName !== this.originalName && this.plugin.settings.groups[newName]) {
+                new Notice('A group with this name already exists');
+                return;
+            }
+
+            this.onSave({
+                originalName: this.originalName,
+                name: newName,
+                icon: this.selectedIcon,
+                color: this.selectedColor,
+                parentGroup: this.hasChildren ? this.selectedParent : this.selectedParent
+            });
+            this.close();
+        });
+
+        const cancelBtn = buttonContainer.createEl('button', { text: 'Cancel' });
+        cancelBtn.addEventListener('click', () => this.close());
+
+        // Handle Enter key in name input
+        nameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                saveBtn.click();
+            }
+        });
+
+        // Focus name input
+        nameInput.focus();
+        nameInput.select();
     }
 
     onClose() {
@@ -3847,15 +4900,13 @@ class QuickAddBookmarkModal extends Modal {
             : [];
         const tagInput = new TagAutocompleteInput(tagsContainer, this.plugin, prefillTags);
 
-        // Group selection
+        // Group selection with inline creation
         const groupContainer = contentEl.createEl('div', { cls: 'frontpage-modal-field' });
         groupContainer.createEl('label', { text: 'Add to Group (optional)' });
-        const groupSelect = groupContainer.createEl('select', { cls: 'frontpage-modal-select' });
-        groupSelect.createEl('option', { text: 'None', attr: { value: '' } });
-        for (const groupName of this.plugin.settings.groupOrder) {
-            const option = groupSelect.createEl('option', { text: groupName, attr: { value: groupName } });
-            if (prefill.group === groupName) option.selected = true;
-        }
+        const groupInput = new GroupComboboxInput(groupContainer, this.plugin, {
+            placeholder: 'Select or create group...',
+            initialValue: prefill.group || null
+        });
 
         // Add to favorites checkbox
         const favContainer = contentEl.createEl('div', { cls: 'frontpage-modal-checkbox' });
@@ -3872,7 +4923,7 @@ class QuickAddBookmarkModal extends Modal {
             const title = titleInput.value.trim() || url;
             const description = descInput.value.trim();
             const tags = tagInput.getTags();
-            const groupName = groupSelect.value;
+            const groupResult = groupInput.getSelectedGroup();
             const addToFavorites = favCheckbox.checked;
 
             if (!url) {
@@ -3888,8 +4939,16 @@ class QuickAddBookmarkModal extends Modal {
             const added = await this.plugin.addBookmark({ title, url, description, tags });
 
             if (added) {
-                if (groupName) {
-                    await this.plugin.addToGroup(url, groupName);
+                if (groupResult) {
+                    // Create new group if needed
+                    if (groupResult.isNew) {
+                        await this.plugin.createGroup(groupResult.name, {
+                            icon: groupResult.icon,
+                            color: groupResult.color,
+                            parentGroup: groupResult.parentGroup
+                        });
+                    }
+                    await this.plugin.addToGroup(url, groupResult.name);
                 }
                 if (addToFavorites) {
                     await this.plugin.addToFavorites(url);
@@ -4637,10 +5696,16 @@ class InsightsModal extends Modal {
             item.setTitle('Create New Group...')
                 .setIcon('folder-plus')
                 .onClick(async () => {
-                    new GroupNameModal(this.app, 'Create Group', '', async (name) => {
-                        await this.plugin.createGroup(name);
-                        await this.plugin.addToGroup(bookmark.url, name);
-                        new Notice(`Created group "${name}" and added bookmark`);
+                    new CreateGroupModal(this.app, this.plugin, async (result) => {
+                        if (result && result.name) {
+                            await this.plugin.createGroup(result.name, {
+                                icon: result.icon,
+                                color: result.color,
+                                parentGroup: result.parentGroup
+                            });
+                            await this.plugin.addToGroup(bookmark.url, result.name);
+                            new Notice(`Created group "${result.name}" and added bookmark`);
+                        }
                     }).open();
                 });
         });
@@ -5422,7 +6487,6 @@ class ExportBookmarksModal extends Modal {
                 enableCollapseAnimations: settings.enableCollapseAnimations,
                 enableKeyboardShortcuts: settings.enableKeyboardShortcuts,
                 enableTags: settings.enableTags,
-                tagTextColor: settings.tagTextColor,
                 showFavorites: settings.showFavorites,
                 showRecentlyAdded: settings.showRecentlyAdded,
                 recentlyAddedCount: settings.recentlyAddedCount,
@@ -5943,7 +7007,7 @@ class ImportSettingsModal extends Modal {
                 'showTableOfContents', 'collapsibleSections', 'persistCollapseState',
                 'highlightSearchResults', 'stickyControlsBar', 'enableAnimations',
                 'enableCardHoverEffects', 'enableCollapseAnimations', 'enableKeyboardShortcuts',
-                'enableTags', 'tagTextColor', 'showFavorites', 'showRecentlyAdded',
+                'enableTags', 'showFavorites', 'showRecentlyAdded',
                 'recentlyAddedCount', 'enableSmartPaste', 'smartPasteDefaultGroup',
                 'showTagCloud', 'tagFilterMode', 'enableAnalytics', 'mostUsedCount',
                 'dormantDaysThreshold', 'enableArchive', 'archiveRetentionDays',
@@ -6061,6 +7125,27 @@ class FrontpageSettingTab extends PluginSettingTab {
                 .setValue(settings.dashboardTitle)
                 .onChange(async (value) => {
                     settings.dashboardTitle = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Dashboard subtitle')
+            .setDesc('Optional subtitle shown below the title')
+            .addText(text => text
+                .setPlaceholder('e.g., Your personal bookmark library')
+                .setValue(settings.dashboardSubtitle || '')
+                .onChange(async (value) => {
+                    settings.dashboardSubtitle = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Show header statistics')
+            .setDesc('Display bookmark, group, and favorite counts in the header')
+            .addToggle(toggle => toggle
+                .setValue(settings.showHeaderStats)
+                .onChange(async (value) => {
+                    settings.showHeaderStats = value;
                     await this.plugin.saveSettings();
                 }));
 
@@ -6225,17 +7310,6 @@ class FrontpageSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName('Tag text color')
-            .setDesc('Color of text inside tags')
-            .addColorPicker(color => color
-                .setValue(settings.tagTextColor || '#ffffff')
-                .onChange(async (value) => {
-                    settings.tagTextColor = value;
-                    this.updateDemoCard();
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
             .setName('Bulk selection')
             .setDesc('Show Select button to select multiple bookmarks for batch operations')
             .addToggle(toggle => toggle
@@ -6254,6 +7328,34 @@ class FrontpageSettingTab extends PluginSettingTab {
                     settings.showOpenAllButtons = value;
                     await this.plugin.saveSettings();
                 }));
+
+        new Setting(containerEl)
+            .setName('Smart Paste')
+            .setDesc('Enable the Paste URL button to automatically fetch metadata from clipboard URLs')
+            .addToggle(toggle => toggle
+                .setValue(settings.enableSmartPaste)
+                .onChange(async (value) => {
+                    settings.enableSmartPaste = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Smart Paste default group
+        const groupNames = Object.keys(settings.groups);
+        new Setting(containerEl)
+            .setName('Smart Paste default group')
+            .setDesc('Automatically assign Smart Paste bookmarks to this group')
+            .addDropdown(dropdown => {
+                dropdown.addOption('', '(None)');
+                for (const name of groupNames) {
+                    dropdown.addOption(name, name);
+                }
+                dropdown
+                    .setValue(settings.smartPasteDefaultGroup || '')
+                    .onChange(async (value) => {
+                        settings.smartPasteDefaultGroup = value;
+                        await this.plugin.saveSettings();
+                    });
+            });
 
         // ============ SPECIAL SECTIONS ============
         containerEl.createEl('h2', { text: 'Special Sections' });
@@ -6927,8 +8029,6 @@ class FrontpageSettingTab extends PluginSettingTab {
         wrapper.style.setProperty('--fp-card-gap', `${cardGap}px`);
         wrapper.style.setProperty('--fp-card-padding', `${cardPadding}px`);
         wrapper.style.setProperty('--fp-card-radius', `${cardBorderRadius}px`);
-        const safeDemoTagColor = sanitizeColor(settings.tagTextColor) || '#ffffff';
-        wrapper.style.setProperty('--fp-tag-text-color', safeDemoTagColor);
 
         // Create grid container for multiple demo cards
         const grid = wrapper.createEl('div', { cls: 'frontpage-grid frontpage-demo-grid' });
@@ -7241,6 +8341,26 @@ module.exports = class FrontpagePlugin extends Plugin {
                 // Filter out URLs that don't exist in bookmarks
                 group.urls = group.urls.filter(url => s.bookmarks[url]);
                 if (!group.createdAt) group.createdAt = Date.now();
+                // Migration: ensure parentGroup field exists (null = top-level)
+                if (group.parentGroup === undefined) {
+                    group.parentGroup = null;
+                }
+            }
+        }
+
+        // Validate parent group references (second pass after all groups are validated)
+        for (const [groupName, group] of Object.entries(s.groups)) {
+            if (group.parentGroup) {
+                // Check if parent exists
+                if (!s.groups[group.parentGroup]) {
+                    console.warn(`Bookmark Manager: Orphaned sub-group "${groupName}", promoting to top-level`);
+                    group.parentGroup = null;
+                }
+                // Check if parent is itself a sub-group (enforce 1-level depth)
+                else if (s.groups[group.parentGroup].parentGroup) {
+                    console.warn(`Bookmark Manager: Sub-group "${groupName}" has nested parent, promoting to top-level`);
+                    group.parentGroup = null;
+                }
             }
         }
 
@@ -7294,8 +8414,7 @@ module.exports = class FrontpagePlugin extends Plugin {
             'enableKeyboardShortcuts', 'enableTags',
             'showFavorites', 'showRecentlyAdded',
             'enableSmartPaste', 'showTagCloud',
-            'enableAnalytics', 'showMostUsed', 'showDormant',
-            'enableArchive', 'showArchivedSection',
+            'enableAnalytics', 'enableArchive', 'showArchivedSection',
             // New UI and advanced feature toggles
             'enableBulkSelection', 'showUncategorized', 'showOpenAllButtons',
             'showCollections', 'enableDuplicateDetection', 'enableBrokenLinkDetection'
@@ -7805,20 +8924,67 @@ module.exports = class FrontpagePlugin extends Plugin {
     async createGroup(name, options = {}) {
         if (this.settings.groups[name]) return false;
 
+        const parentGroup = options.parentGroup || null;
+
+        // Validate parent if specified
+        if (parentGroup) {
+            // Parent must exist
+            if (!this.settings.groups[parentGroup]) return false;
+            // Parent must be top-level (no nested sub-groups allowed)
+            if (this.settings.groups[parentGroup].parentGroup) return false;
+        }
+
         this.settings.groups[name] = {
             urls: [],
             icon: options.icon || '📁',
             color: options.color || '',
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            parentGroup: parentGroup
         };
-        this.settings.groupOrder.push(name);
+
+        // Insert at correct position in groupOrder
+        if (parentGroup) {
+            // Find position after parent and its existing children
+            let insertIdx = this.settings.groupOrder.indexOf(parentGroup) + 1;
+            for (let i = insertIdx; i < this.settings.groupOrder.length; i++) {
+                const g = this.settings.groups[this.settings.groupOrder[i]];
+                if (g?.parentGroup === parentGroup) {
+                    insertIdx = i + 1;
+                } else {
+                    break;
+                }
+            }
+            this.settings.groupOrder.splice(insertIdx, 0, name);
+        } else {
+            this.settings.groupOrder.push(name);
+        }
 
         await this.saveSettings();
         return true;
     }
 
-    async deleteGroup(name) {
+    async deleteGroup(name, options = { promoteChildren: true }) {
         if (!this.settings.groups[name]) return false;
+
+        const group = this.settings.groups[name];
+        const isParent = !group.parentGroup;
+
+        if (isParent) {
+            // Handle children when deleting a parent group
+            const children = this.getSubGroups(name);
+            if (options.promoteChildren) {
+                // Promote children to top-level
+                for (const childName of children) {
+                    this.settings.groups[childName].parentGroup = null;
+                }
+            } else {
+                // Cascade delete children
+                for (const childName of children) {
+                    delete this.settings.groups[childName];
+                    this.settings.groupOrder = this.settings.groupOrder.filter(n => n !== childName);
+                }
+            }
+        }
 
         delete this.settings.groups[name];
         this.settings.groupOrder = this.settings.groupOrder.filter(n => n !== name);
@@ -7837,6 +9003,13 @@ module.exports = class FrontpagePlugin extends Plugin {
         const index = this.settings.groupOrder.indexOf(oldName);
         if (index !== -1) {
             this.settings.groupOrder[index] = newName;
+        }
+
+        // Update any children's parentGroup reference
+        for (const [groupName, group] of Object.entries(this.settings.groups)) {
+            if (group.parentGroup === oldName) {
+                group.parentGroup = newName;
+            }
         }
 
         await this.saveSettings();
@@ -7912,6 +9085,136 @@ module.exports = class FrontpagePlugin extends Plugin {
         this.settings.groupOrder.splice(newIndex, 0, name);
 
         await this.saveSettings();
+    }
+
+    // ========== SUB-GROUP HELPERS ==========
+
+    /**
+     * Check if a group is a top-level (parent) group
+     * @param {string} groupName - Name of the group
+     * @returns {boolean}
+     */
+    isTopLevelGroup(groupName) {
+        const group = this.settings.groups[groupName];
+        return group && !group.parentGroup;
+    }
+
+    /**
+     * Check if a group is a sub-group
+     * @param {string} groupName - Name of the group
+     * @returns {boolean}
+     */
+    isSubGroup(groupName) {
+        const group = this.settings.groups[groupName];
+        return group && !!group.parentGroup;
+    }
+
+    /**
+     * Get all sub-groups of a parent group
+     * @param {string} parentName - Name of the parent group
+     * @returns {string[]} Array of child group names
+     */
+    getSubGroups(parentName) {
+        return Object.entries(this.settings.groups)
+            .filter(([_, group]) => group.parentGroup === parentName)
+            .map(([name, _]) => name);
+    }
+
+    /**
+     * Get the parent of a sub-group
+     * @param {string} groupName - Name of the group
+     * @returns {string|null} Parent name or null if top-level
+     */
+    getParentGroup(groupName) {
+        const group = this.settings.groups[groupName];
+        return group?.parentGroup || null;
+    }
+
+    /**
+     * Get groups in hierarchical order for display
+     * Returns top-level groups with their sub-groups immediately after
+     * @returns {Array<{name: string, isSubGroup: boolean, parent: string|null, depth: number}>}
+     */
+    getHierarchicalGroupOrder() {
+        const result = [];
+        const processed = new Set();
+
+        for (const name of this.settings.groupOrder) {
+            if (processed.has(name)) continue;
+
+            const group = this.settings.groups[name];
+            if (!group) continue;
+
+            // Skip sub-groups in first pass (they'll be added under their parent)
+            if (group.parentGroup) continue;
+
+            // Add parent group
+            result.push({ name, isSubGroup: false, parent: null, depth: 0 });
+            processed.add(name);
+
+            // Add its children in order
+            for (const childName of this.settings.groupOrder) {
+                if (processed.has(childName)) continue;
+                const child = this.settings.groups[childName];
+                if (child?.parentGroup === name) {
+                    result.push({ name: childName, isSubGroup: true, parent: name, depth: 1 });
+                    processed.add(childName);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Set or change the parent group of a group
+     * @param {string} groupName - Name of the group to modify
+     * @param {string|null} newParentName - New parent name, or null to make top-level
+     * @returns {Promise<boolean>}
+     */
+    async setParentGroup(groupName, newParentName) {
+        const group = this.settings.groups[groupName];
+        if (!group) return false;
+
+        // Cannot make a parent group (that has children) into a sub-group
+        if (this.getSubGroups(groupName).length > 0) {
+            return false;
+        }
+
+        if (newParentName) {
+            // Validate new parent exists and is top-level
+            if (!this.settings.groups[newParentName]) return false;
+            if (this.settings.groups[newParentName].parentGroup) return false;
+            // Cannot be its own parent
+            if (groupName === newParentName) return false;
+        }
+
+        // Remove from current position in groupOrder
+        this.settings.groupOrder = this.settings.groupOrder.filter(n => n !== groupName);
+
+        // Update parent reference
+        group.parentGroup = newParentName || null;
+
+        // Insert at correct position
+        if (newParentName) {
+            // Find position after parent and its existing children
+            let insertIdx = this.settings.groupOrder.indexOf(newParentName) + 1;
+            for (let i = insertIdx; i < this.settings.groupOrder.length; i++) {
+                const g = this.settings.groups[this.settings.groupOrder[i]];
+                if (g?.parentGroup === newParentName) {
+                    insertIdx = i + 1;
+                } else {
+                    break;
+                }
+            }
+            this.settings.groupOrder.splice(insertIdx, 0, groupName);
+        } else {
+            // Add to end as top-level
+            this.settings.groupOrder.push(groupName);
+        }
+
+        await this.saveSettings();
+        return true;
     }
 
     /**
